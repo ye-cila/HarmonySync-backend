@@ -83,8 +83,6 @@ app.get('/', (req, res) => {
   res.send('🚀 HarmonySync Backend Server is Running!');
 });
 
-
-// Lắng nghe cổng
 app.listen(PORT, () => {
   console.log(`=================================`);
   console.log(`🎉 Server is running at: http://127.0.0.1:${PORT}`);
