@@ -64,13 +64,9 @@ app.get('/callback', async (req,res) => {
 
     const { access_token, refresh_token, expires_in } = response.data;
 
-    // Successfully receive token (which then redirected to Frontend)
-    res.json({
-      message: '🎉 Successfully log in to Spotify!',
-      access_token,
-      refresh_token,
-      expires_in,
-    });
+    // Redirect user back to frontend
+    res.redirect(`http://127.0.0.1:5173/?access_token=${access_token}&refresh_token=${refresh_token}`);
+
   } catch (error) {
     console.error('Error fetching token:', error.response?.data || error.message);
     res.status(500).json({ error: 'Authentication failed', details: error.response?.data });
