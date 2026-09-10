@@ -4,6 +4,7 @@ const axios = require('axios');
 const querystring = require('querystring');
 require('dotenv').config();
 
+const CLIENT_URL = process.env.CLIENT_URL || 'http://127.0.0.1:5173';
 const { generateRandomString, generateCodeChallenge } = require('./pkceHelper');
 
 const app = express();
@@ -65,7 +66,7 @@ app.get('/callback', async (req,res) => {
     const { access_token, refresh_token, expires_in } = response.data;
 
     // Redirect user back to frontend
-    res.redirect(`http://127.0.0.1:5173/?access_token=${access_token}&refresh_token=${refresh_token}`);
+    res.redirect(`${CLIENT_URL}/?access_token=${access_token}&refresh_token=${refresh_token}`);
 
   } catch (error) {
     console.error('Error fetching token:', error.response?.data || error.message);
