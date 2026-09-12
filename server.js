@@ -1,3 +1,5 @@
+const http = require('http');
+const { Server } = require('socket.io');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -11,6 +13,13 @@ const CLIENT_URL = process.env.CLIENT_URL || 'http://127.0.0.1:5173';
 const { generateRandomString, generateCodeChallenge } = require('./pkceHelper');
 
 const app = express();
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+  },
+});
 const PORT = process.env.PORT || 8888;
 
 const generateRoomCode = () => {
@@ -126,12 +135,32 @@ app.post('/rooms/:roomCode/join', (req, res) => {
   });
 });
 
+io.on('connection', (socket) => {
+  console.log('A user connected:', socket.id);
+
+  socket.on('join-room', (roomCode) => {
+    socket.join(roomCode);
+
+    console.log(`${socket.id} joined room ${roomCode}`);
+
+    const room = rooms.get(roomCode);
+
+    if (room) {
+      io.to(roomCode).emit('room-users', room.users);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('A user disconnected:', socket.id);
+  });
+});
+
 // Endpoint checking server status
 app.get('/', (req, res) => {
   res.send('🚀 HarmonySync Backend Server is Running!');
 });
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`=================================`);
   console.log(`🎉 Server is running at: http://127.0.0.1:${PORT}`);
   console.log(`=================================`);
