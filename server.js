@@ -3,12 +3,19 @@ const cors = require('cors');
 const axios = require('axios');
 const querystring = require('querystring');
 require('dotenv').config();
+const crypto = require('crypto');
+
+const rooms = new Map();
 
 const CLIENT_URL = process.env.CLIENT_URL || 'http://127.0.0.1:5173';
 const { generateRandomString, generateCodeChallenge } = require('./pkceHelper');
 
 const app = express();
 const PORT = process.env.PORT || 8888;
+
+const generateRoomCode = () => {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+};
 
 // Middleware
 app.use(cors());
@@ -74,6 +81,50 @@ app.get('/callback', async (req,res) => {
   }
 
 })
+
+// Room route
+app.post('/rooms', (req, res) => {
+  let roomCode = generateRoomCode();
+
+  while (rooms.has(roomCode)) {
+    roomCode = generateRoomCode();
+  }
+
+  const userId = crypto.randomUUID();
+
+  rooms.set(roomCode, {
+    users: [{
+      id: userId,
+    }],
+  });
+
+  res.json({
+    roomCode,
+    users: rooms.get(roomCode).users,
+  });
+});
+
+// Joining room
+app.post('/rooms/:roomCode/join', (req, res) => {
+  const roomCode = req.params.roomCode.toUpperCase();
+
+  const room = rooms.get(roomCode);
+
+  if (!room) {
+    return res.status(404).json({
+      error: 'Room not found',
+    });
+  }
+
+  room.users.push({
+    id: crypto.randomUUID(),
+  });
+
+  res.json({
+    roomCode,
+    users: room.users,
+  });
+});
 
 // Endpoint checking server status
 app.get('/', (req, res) => {
