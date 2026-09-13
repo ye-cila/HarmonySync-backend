@@ -109,6 +109,7 @@ app.post('/rooms', (req, res) => {
 
   res.json({
     roomCode,
+    userId,
     users: rooms.get(roomCode).users,
   });
 });
@@ -125,12 +126,15 @@ app.post('/rooms/:roomCode/join', (req, res) => {
     });
   }
 
+  const userId = crypto.randomUUID();
+
   room.users.push({
-    id: crypto.randomUUID(),
+    id: userId,
   });
 
   res.json({
     roomCode,
+    userId,
     users: room.users,
   });
 });
@@ -138,20 +142,50 @@ app.post('/rooms/:roomCode/join', (req, res) => {
 io.on('connection', (socket) => {
   console.log('A user connected:', socket.id);
 
-  socket.on('join-room', (roomCode) => {
+  socket.on('join-room', ({ roomCode, userId, topArtists, topTracks }) => {
     socket.join(roomCode);
+
+    socket.data.roomCode = roomCode;
+    socket.data.userId = userId;
+    socket.data.topArtists = topArtists;
+    socket.data.topTracks = topTracks;
 
     console.log(`${socket.id} joined room ${roomCode}`);
 
     const room = rooms.get(roomCode);
 
-    if (room) {
-      io.to(roomCode).emit('room-users', room.users);
+    if (!room) {
+      return;
     }
+
+    const user = room.users.find((user) => user.id === userId);
+
+    if (user) {
+      user.topArtists = topArtists;
+      user.topTracks = topTracks;
+    }
+             
+    io.to(roomCode).emit('room-users', room.users);
   });
 
   socket.on('disconnect', () => {
-    console.log('A user disconnected:', socket.id);
+    const { roomCode, userId } = socket.data;
+
+    console.log(`${socket.id} disconnected`);
+
+    if (!roomCode || !userId) {
+      return;
+    }
+
+    const room = rooms.get(roomCode);
+
+    if (!room) {
+      return;
+    }
+
+    room.users = room.users.filter((user) => user.id !== userId);
+
+    io.to(roomCode).emit('room-users', room.users);
   });
 });
 
