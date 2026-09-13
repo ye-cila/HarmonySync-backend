@@ -93,6 +93,18 @@ app.get('/callback', async (req,res) => {
 
 // Room route
 app.post('/rooms', (req, res) => {
+  const maxUsers = Number(req.body.maxUsers);
+
+  if (
+    !Number.isInteger(maxUsers) ||
+    maxUsers < 2 ||
+    maxUsers > 8
+  ) {
+    return res.status(400).json({
+      error: 'Room size must be between 2 and 8 people',
+    });
+  }
+
   let roomCode = generateRoomCode();
 
   while (rooms.has(roomCode)) {
@@ -102,6 +114,7 @@ app.post('/rooms', (req, res) => {
   const userId = crypto.randomUUID();
 
   rooms.set(roomCode, {
+    maxUsers,
     users: [{
       id: userId,
     }],
@@ -111,6 +124,7 @@ app.post('/rooms', (req, res) => {
     roomCode,
     userId,
     users: rooms.get(roomCode).users,
+    maxUsers,
   });
 });
 
@@ -126,6 +140,12 @@ app.post('/rooms/:roomCode/join', (req, res) => {
     });
   }
 
+  if (room.users.length >= room.maxUsers) {
+    return res.status(409).json({
+      error: 'Room is full',
+    });
+  }
+
   const userId = crypto.randomUUID();
 
   room.users.push({
@@ -136,6 +156,7 @@ app.post('/rooms/:roomCode/join', (req, res) => {
     roomCode,
     userId,
     users: room.users,
+    maxUsers: room.maxUsers,
   });
 });
 
