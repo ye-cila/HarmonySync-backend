@@ -266,9 +266,35 @@ io.on('connection', (socket) => {
       return;
     }
 
-    room.users = room.users.filter((user) => user.id !== userId);
+    const user = room.users.find(
+      (user) => user.id === userId
+    );
 
+    if (!user) {
+      return;
+    }
+
+    const playerName = user.playerName;
+
+    room.users = room.users.filter(
+      (user) => user.id !== userId
+    );
+
+    // Tell the remaining players who left
+    io.to(roomCode).emit('player-left', {
+      userId,
+      playerName,
+    });
+
+    // Update the room's player list
     io.to(roomCode).emit('room-users', room.users);
+
+    // If only one player remains, stop the game
+    if (room.users.length < 2) {
+      games.delete(roomCode);
+
+      io.to(roomCode).emit('game-ended');
+    }
   });
 
   const finishRound = (roomCode) => {
@@ -426,11 +452,16 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('next-round', ({ roomCode }) => {
+  socket.on('next-round', ({ roomCode, userId }) => {
     const game = games.get(roomCode);
     const room = rooms.get(roomCode);
 
     if (!game || !room) {
+      return;
+    }
+
+    // Only the host can advance the game
+    if (room.users[0]?.id !== userId) {
       return;
     }
 
