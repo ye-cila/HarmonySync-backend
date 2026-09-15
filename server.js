@@ -8,6 +8,7 @@ require('dotenv').config();
 const crypto = require('crypto');
 
 const rooms = new Map();
+const games = new Map();
 
 const CLIENT_URL = process.env.CLIENT_URL || 'http://127.0.0.1:5173';
 const { generateRandomString, generateCodeChallenge } = require('./pkceHelper');
@@ -91,6 +92,47 @@ app.get('/callback', async (req,res) => {
 
 })
 
+// Refresh Spotify access token
+app.post('/refresh', async (req, res) => {
+  const { refresh_token } = req.body;
+
+  if (!refresh_token) {
+    return res.status(400).json({
+      error: 'Refresh token missing',
+    });
+  }
+
+  try {
+    const response = await axios({
+      method: 'post',
+      url: 'https://accounts.spotify.com/api/token',
+      data: querystring.stringify({
+        grant_type: 'refresh_token',
+        refresh_token,
+        client_id: process.env.SPOTIFY_CLIENT_ID,
+      }),
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    });
+
+    res.json({
+      access_token: response.data.access_token,
+      expires_in: response.data.expires_in,
+    });
+
+  } catch (error) {
+    console.error(
+      'Error refreshing token:',
+      error.response?.data || error.message
+    );
+
+    res.status(500).json({
+      error: 'Could not refresh access token',
+    });
+  }
+});
+
 // Room route
 app.post('/rooms', (req, res) => {
   const maxUsers = Number(req.body.maxUsers);
@@ -163,7 +205,13 @@ app.post('/rooms/:roomCode/join', (req, res) => {
 io.on('connection', (socket) => {
   console.log('A user connected:', socket.id);
 
-  socket.on('join-room', ({ roomCode, userId, topArtists, topTracks }) => {
+  socket.on('join-room', ({
+    roomCode,
+    userId,
+    playerName,
+    topArtists,
+    topTracks,
+  }) => {
     socket.join(roomCode);
 
     socket.data.roomCode = roomCode;
@@ -182,6 +230,7 @@ io.on('connection', (socket) => {
     const user = room.users.find((user) => user.id === userId);
 
     if (user) {
+      user.playerName = playerName;
       user.topArtists = topArtists;
       user.topTracks = topTracks;
     }
@@ -207,6 +256,175 @@ io.on('connection', (socket) => {
     room.users = room.users.filter((user) => user.id !== userId);
 
     io.to(roomCode).emit('room-users', room.users);
+  });
+
+  socket.on('start-game', ({ roomCode }) => {
+    const room = rooms.get(roomCode);
+
+    if (!room || room.users.length < 2) {
+      return;
+    }
+
+    const randomUserIndex = Math.floor(
+      Math.random() * room.users.length
+    );
+
+    const selectedUser = room.users[randomUserIndex];
+
+    const randomTrackIndex = Math.floor(
+      Math.random() * selectedUser.topTracks.length
+    );
+
+    const selectedTrack = selectedUser.topTracks[randomTrackIndex];
+
+    games.set(roomCode, {
+      correctUserId: selectedUser.id,
+      currentRound: 1,
+      startedAt: Date.now(),
+      scores: new Map(),
+      answers: new Map(),
+    });
+
+    room.users.forEach((user) => {
+      games.get(roomCode).scores.set(user.id, 0);
+    });
+
+    io.to(roomCode).emit('game-started');
+
+    io.to(roomCode).emit('new-round', {
+      track: {
+        name: selectedTrack.name,
+        artist: selectedTrack.artists[0].name,
+        image: selectedTrack.album?.images?.[0]?.url || '',
+      },
+      choices: room.users.map((user) => ({
+        id: user.id,
+      })),
+      round: 1,
+    });
+  });
+
+  socket.on('submit-answer', ({ roomCode, userId, selectedUserId }) => {
+    const game = games.get(roomCode);
+
+    if (!game) {
+      return;
+    }
+
+    const room = rooms.get(roomCode);
+
+    if (!room) {
+      return;
+    }
+
+    // Prevent a player from answering twice
+    if (game.answers.has(userId)) {
+      return;
+    }
+
+    const answerTime = Date.now() - game.startedAt;
+    const isCorrect = selectedUserId === game.correctUserId;
+
+    let points = 0;
+
+    if (isCorrect) {
+      if (answerTime <= 2000) {
+        points = 100;
+      } else if (answerTime <= 5000) {
+        points = 75;
+      } else {
+        points = 50;
+      }
+    }
+
+    const currentScore = game.scores.get(userId) || 0;
+    game.scores.set(userId, currentScore + points);
+
+    game.answers.set(userId, {
+      selectedUserId,
+      correct: isCorrect,
+      time: answerTime,
+      points,
+    });
+
+    console.log(
+      `${userId} answered ${isCorrect ? 'CORRECT' : 'WRONG'} in ${answerTime}ms for ${points} points`
+    );
+
+    // Wait until everyone has answered
+    if (game.answers.size < room.users.length) {
+      return;
+    }
+
+    const leaderboard = room.users
+      .map((user) => ({
+        userId: user.id,
+        score: game.scores.get(user.id) || 0,
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    room.users.forEach((user) => {
+      const answer = game.answers.get(user.id);
+
+      const targetSocket = [...io.sockets.sockets.values()].find(
+        (socket) => socket.data.userId === user.id
+      );
+
+      if (targetSocket) {
+        targetSocket.emit('round-result', {
+          correct: answer.correct,
+          points: answer.points,
+          time: answer.time,
+          leaderboard,
+        });
+      }
+    });
+  });
+
+  socket.on('next-round', ({ roomCode }) => {
+    const game = games.get(roomCode);
+    const room = rooms.get(roomCode);
+
+    if (!game || !room) {
+      return;
+    }
+
+    game.currentRound += 1;
+
+    // Reset answers for the new round
+    game.answers = new Map();
+
+    // Pick a random player
+    const randomUserIndex = Math.floor(
+      Math.random() * room.users.length
+    );
+
+    const selectedUser = room.users[randomUserIndex];
+
+    // Pick a random track from that player's Top Tracks
+    const randomTrackIndex = Math.floor(
+      Math.random() * selectedUser.topTracks.length
+    );
+
+    const selectedTrack = selectedUser.topTracks[randomTrackIndex];
+
+    // Store the correct answer for this round
+    game.correctUserId = selectedUser.id;
+
+    // Reset the timer
+    game.startedAt = Date.now();
+
+    io.to(roomCode).emit('new-round', {
+      track: {
+        name: selectedTrack.name,
+        artist: selectedTrack.artists[0].name,
+        image: selectedTrack.album?.images?.[0]?.url || '',
+      },
+      choices: room.users.map((user) => ({
+        id: user.id,
+      })),
+      round: game.currentRound,
+    });
   });
 });
 
