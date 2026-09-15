@@ -227,6 +227,17 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const nameTaken = room.users.some(
+      (user) =>
+        user.playerName?.toLowerCase() === playerName.trim().toLowerCase() &&
+        user.id !== userId
+    );
+
+    if (nameTaken) {
+      socket.emit('name-taken');
+      return;
+    }
+
     const user = room.users.find((user) => user.id === userId);
 
     if (user) {
@@ -234,6 +245,8 @@ io.on('connection', (socket) => {
       user.topArtists = topArtists;
       user.topTracks = topTracks;
     }
+
+    socket.emit('join-room-success');
              
     io.to(roomCode).emit('room-users', room.users);
   });
@@ -257,6 +270,57 @@ io.on('connection', (socket) => {
 
     io.to(roomCode).emit('room-users', room.users);
   });
+
+  const finishRound = (roomCode) => {
+    const game = games.get(roomCode);
+    const room = rooms.get(roomCode);
+
+    if (!game || !room) {
+      return;
+    }
+
+    // Prevent this round from ending twice
+    if (game.roundTimer) {
+      clearTimeout(game.roundTimer);
+      game.roundTimer = null;
+    }
+
+    // Players who didn't answer are automatically wrong
+    room.users.forEach((user) => {
+      if (!game.answers.has(user.id)) {
+        game.answers.set(user.id, {
+          selectedUserId: null,
+          correct: false,
+          time: 15000,
+          points: 0,
+        });
+      }
+    });
+
+    const leaderboard = room.users
+      .map((user) => ({
+        userId: user.id,
+        score: game.scores.get(user.id) || 0,
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    room.users.forEach((user) => {
+      const answer = game.answers.get(user.id);
+
+      const targetSocket = [...io.sockets.sockets.values()].find(
+        (socket) => socket.data.userId === user.id
+      );
+
+      if (targetSocket) {
+        targetSocket.emit('round-result', {
+          correct: answer.correct,
+          points: answer.points,
+          time: answer.time,
+          leaderboard,
+        });
+      }
+    });
+  };
 
   socket.on('start-game', ({ roomCode }) => {
     const room = rooms.get(roomCode);
@@ -283,6 +347,7 @@ io.on('connection', (socket) => {
       startedAt: Date.now(),
       scores: new Map(),
       answers: new Map(),
+      roundTimer: null,
     });
 
     room.users.forEach((user) => {
@@ -302,6 +367,10 @@ io.on('connection', (socket) => {
       })),
       round: 1,
     });
+
+    games.get(roomCode).roundTimer = setTimeout(() => {
+      finishRound(roomCode);
+    }, 15000);
   });
 
   socket.on('submit-answer', ({ roomCode, userId, selectedUserId }) => {
@@ -351,34 +420,10 @@ io.on('connection', (socket) => {
       `${userId} answered ${isCorrect ? 'CORRECT' : 'WRONG'} in ${answerTime}ms for ${points} points`
     );
 
-    // Wait until everyone has answered
-    if (game.answers.size < room.users.length) {
-      return;
+    // End the round immediately if everyone has answered
+    if (game.answers.size === room.users.length) {
+      finishRound(roomCode);
     }
-
-    const leaderboard = room.users
-      .map((user) => ({
-        userId: user.id,
-        score: game.scores.get(user.id) || 0,
-      }))
-      .sort((a, b) => b.score - a.score);
-
-    room.users.forEach((user) => {
-      const answer = game.answers.get(user.id);
-
-      const targetSocket = [...io.sockets.sockets.values()].find(
-        (socket) => socket.data.userId === user.id
-      );
-
-      if (targetSocket) {
-        targetSocket.emit('round-result', {
-          correct: answer.correct,
-          points: answer.points,
-          time: answer.time,
-          leaderboard,
-        });
-      }
-    });
   });
 
   socket.on('next-round', ({ roomCode }) => {
@@ -425,6 +470,49 @@ io.on('connection', (socket) => {
       })),
       round: game.currentRound,
     });
+
+    game.roundTimer = setTimeout(() => {
+      finishRound(roomCode);
+    }, 15000);
+  });
+
+  socket.on('quit-game', ({ roomCode, userId }) => {
+    const room = rooms.get(roomCode);
+
+    if (!room) {
+      return;
+    }
+
+    const user = room.users.find(
+      (user) => user.id === userId
+    );
+
+    if (!user) {
+      return;
+    }
+
+    const playerName = user.playerName;
+
+    room.users = room.users.filter(
+      (user) => user.id !== userId
+    );
+
+    if (room.users.length < 2) {
+      games.delete(roomCode);
+
+      io.to(roomCode).emit('game-ended');
+    }
+
+    io.to(roomCode).emit('player-left', {
+      userId,
+      playerName,
+    });
+
+    io.to(roomCode).emit('room-users', room.users);
+
+    socket.leave(roomCode);
+
+    console.log(`${playerName} left game ${roomCode}`);
   });
 });
 
