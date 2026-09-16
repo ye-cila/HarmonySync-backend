@@ -13,6 +13,7 @@ const werewolfGames = new Map();
 
 const CLIENT_URL = process.env.CLIENT_URL || 'http://127.0.0.1:5173';
 const { generateRandomString, generateCodeChallenge } = require('./pkceHelper');
+const { CONTEXTS, createContextBlend } = require('./contextBlend');
 
 const app = express();
 const server = http.createServer(app);
@@ -23,6 +24,7 @@ const io = new Server(server, {
   },
 });
 const PORT = process.env.PORT || 8888;
+const WEREWOLF_VOTING_SECONDS = 30;
 
 const generateRoomCode = () => {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -54,6 +56,8 @@ const createWerewolfGame = (room) => {
     clues: new Map(),
     votes: new Map(),
     eliminatedPlayers: [],
+    votingTimer: null,
+    imposterGuessTimer: null,
   };
 };
 
@@ -71,6 +75,267 @@ const getRandomTrack = (room) => {
   );
 
   return allTracks[randomIndex];
+};
+
+const startWerewolfGame = (roomCode) => {
+  const room = rooms.get(roomCode);
+
+  if (!room || room.users.length < 4) {
+    return false;
+  }
+
+  const allTracks = room.users.flatMap(
+    (user) => user.topTracks || []
+  );
+
+  if (allTracks.length < 2) {
+    return false;
+  }
+
+  const listenerSong = allTracks[
+    Math.floor(Math.random() * allTracks.length)
+  ];
+  const differentTracks = allTracks.filter(
+    (track) => track.id !== listenerSong.id
+  );
+  const imposterSong = differentTracks[
+    Math.floor(Math.random() * differentTracks.length)
+  ];
+
+  if (!listenerSong || !imposterSong) {
+    return false;
+  }
+
+  const previousGame = werewolfGames.get(roomCode);
+  if (previousGame?.votingTimer) {
+    clearTimeout(previousGame.votingTimer);
+  }
+  if (previousGame?.imposterGuessTimer) {
+    clearTimeout(previousGame.imposterGuessTimer);
+  }
+
+  const game = createWerewolfGame(room);
+  game.listenerSong = listenerSong;
+  game.imposterSong = imposterSong;
+  werewolfGames.set(roomCode, game);
+
+  room.users.forEach((user) => {
+    const targetSocket = [...io.sockets.sockets.values()].find(
+      (roomSocket) => roomSocket.data.userId === user.id
+    );
+
+    if (!targetSocket) {
+      return;
+    }
+
+    const role = game.roles.get(user.id);
+    const song = role === 'imposter'
+      ? game.imposterSong
+      : game.listenerSong;
+
+    targetSocket.emit('werewolf-started', {
+      role,
+      song: {
+        name: song.name,
+        artist: song.artists?.[0]?.name || 'Unknown Artist',
+        image: song.album?.images?.[0]?.url || '',
+        spotifyUrl: song.external_urls?.spotify || '',
+      },
+    });
+  });
+
+  console.log(`Werewolf game started in room ${roomCode}`);
+  return true;
+};
+
+const scheduleWerewolfImposterGuess = (roomCode, game) => {
+  if (!game || game.phase === 'imposter-guess' || game.imposterGuessTimer) {
+    return;
+  }
+
+  if (game.votingTimer) {
+    clearTimeout(game.votingTimer);
+    game.votingTimer = null;
+  }
+  if (game.phase === 'voting') {
+    game.phase = 'voting-results';
+  }
+
+  game.imposterGuessTimer = setTimeout(() => {
+    game.imposterGuessTimer = null;
+    const currentGame = werewolfGames.get(roomCode);
+
+    if (!currentGame || currentGame !== game) {
+      return;
+    }
+
+    currentGame.phase = 'imposter-guess';
+    currentGame.clues = new Map();
+    currentGame.votes = new Map();
+    io.to(roomCode).emit('werewolf-imposter-guess-start');
+    console.log(`Imposter final guess started in room ${roomCode}`);
+  }, 3000);
+};
+
+const startWerewolfVoting = (roomCode) => {
+  const game = werewolfGames.get(roomCode);
+  const room = rooms.get(roomCode);
+
+  if (!game || !room || game.phase !== 'clue') {
+    return false;
+  }
+
+  const activePlayers = room.users.filter(
+    (user) => !game.eliminatedPlayers.includes(user.id)
+  );
+
+  if (activePlayers.length === 0) {
+    return false;
+  }
+
+  // With only two active players left, there is no useful vote to resolve.
+  // Move the imposter to the final guess phase so the game can finish cleanly.
+  if (
+    activePlayers.length <= 2 &&
+    activePlayers.some((player) => player.id === game.imposterId)
+  ) {
+    scheduleWerewolfImposterGuess(roomCode, game);
+    return true;
+  }
+
+  if (game.clues.size !== activePlayers.length) {
+    return false;
+  }
+
+  game.phase = 'voting';
+  game.votingTimer = setTimeout(() => {
+    resolveWerewolfVoting(roomCode, true);
+  }, WEREWOLF_VOTING_SECONDS * 1000);
+
+  const clues = activePlayers.map((user) => ({
+    userId: user.id,
+    playerName: user.playerName,
+    clue: game.clues.get(user.id).clue,
+  }));
+
+  io.to(roomCode).emit('werewolf-voting-start', {
+    clues,
+    durationSeconds: WEREWOLF_VOTING_SECONDS,
+  });
+
+  return true;
+};
+
+const resolveWerewolfVoting = (roomCode, timedOut = false) => {
+  const game = werewolfGames.get(roomCode);
+  const room = rooms.get(roomCode);
+
+  if (!game || !room || game.phase !== 'voting') {
+    return;
+  }
+
+  if (game.votingTimer) {
+    clearTimeout(game.votingTimer);
+    game.votingTimer = null;
+  }
+
+  const activePlayers = room.users.filter(
+    (user) => !game.eliminatedPlayers.includes(user.id)
+  );
+
+  if (activePlayers.length === 0) {
+    return;
+  }
+
+  const activeIds = new Set(activePlayers.map((user) => user.id));
+  const voteCounts = new Map();
+
+  game.votes.forEach((votedUserId) => {
+    if (!activeIds.has(votedUserId)) {
+      return;
+    }
+
+    voteCounts.set(
+      votedUserId,
+      (voteCounts.get(votedUserId) || 0) + 1
+    );
+  });
+
+  const highestVotes = Math.max(
+    ...activePlayers.map((player) => voteCounts.get(player.id) || 0)
+  );
+  const leaders = activePlayers.filter(
+    (player) => (voteCounts.get(player.id) || 0) === highestVotes
+  );
+  const isTie = leaders.length > 1;
+  const eliminatedPlayer = isTie ? null : leaders[0];
+
+  const voteResults = activePlayers.map((user) => ({
+    playerName: user.playerName,
+    votedUserId: game.votes.get(user.id) || null,
+  }));
+  const isImposter = Boolean(
+    eliminatedPlayer && eliminatedPlayer.id === game.imposterId
+  );
+
+  game.phase = 'voting-results';
+  if (eliminatedPlayer && !isImposter) {
+    game.eliminatedPlayers.push(eliminatedPlayer.id);
+  }
+
+  const remainingActivePlayers = room.users.filter(
+    (user) => !game.eliminatedPlayers.includes(user.id)
+  );
+  const imposterGuessPending = isImposter || (
+    remainingActivePlayers.length <= 2 &&
+    remainingActivePlayers.some((player) => player.id === game.imposterId)
+  );
+
+  io.to(roomCode).emit('werewolf-voting-results', {
+    votes: voteResults,
+    eliminatedPlayer: eliminatedPlayer
+      ? {
+          userId: eliminatedPlayer.id,
+          playerName: eliminatedPlayer.playerName,
+        }
+      : null,
+    isTie,
+    tiedPlayers: isTie
+      ? leaders.map((player) => ({
+          userId: player.id,
+          playerName: player.playerName,
+          votes: highestVotes,
+        }))
+      : [],
+    voteCounts: activePlayers.map((player) => ({
+      userId: player.id,
+      playerName: player.playerName,
+      votes: voteCounts.get(player.id) || 0,
+    })),
+    isImposter,
+    imposterGuessPending,
+    timedOut,
+    abstentions: activePlayers.filter((user) => !game.votes.has(user.id)).length,
+  });
+
+  if (imposterGuessPending) {
+    scheduleWerewolfImposterGuess(roomCode, game);
+    return;
+  }
+
+  setTimeout(() => {
+    const currentGame = werewolfGames.get(roomCode);
+
+    if (!currentGame || currentGame !== game) {
+      return;
+    }
+
+    currentGame.clues = new Map();
+    currentGame.votes = new Map();
+    currentGame.phase = 'clue';
+    io.to(roomCode).emit('werewolf-new-clue-round');
+    console.log(`Werewolf new clue round started in room ${roomCode}`);
+  }, 3000);
 };
 
 // Middleware
@@ -203,6 +468,7 @@ app.post('/rooms', (req, res) => {
 
   rooms.set(roomCode, {
     maxUsers,
+    blendContext: 'focus',
     users: [{
       id: userId,
     }],
@@ -257,6 +523,7 @@ io.on('connection', (socket) => {
     playerName,
     topArtists,
     topTracks,
+    blendCandidates,
   }) => {
     socket.join(roomCode);
 
@@ -264,6 +531,7 @@ io.on('connection', (socket) => {
     socket.data.userId = userId;
     socket.data.topArtists = topArtists;
     socket.data.topTracks = topTracks;
+    socket.data.blendCandidates = blendCandidates;
 
     console.log(`${socket.id} joined room ${roomCode}`);
 
@@ -290,78 +558,163 @@ io.on('connection', (socket) => {
       user.playerName = playerName;
       user.topArtists = topArtists;
       user.topTracks = topTracks;
+      user.blendCandidates = blendCandidates || [];
+    }
+
+    const readyUsers = room.users.filter(
+      (roomUser) => (roomUser.topTracks || []).length > 0 || (roomUser.blendCandidates || []).length > 0
+    );
+
+    if (readyUsers.length >= 2) {
+      try {
+        room.blend = createContextBlend(readyUsers, room.blendContext || 'focus', { limit: 120 });
+      } catch (error) {
+        room.blend = null;
+        socket.emit('context-blend-error', { error: error.message });
+      }
     }
 
     socket.emit('join-room-success');
+    socket.emit('blend-context-state', {
+      context: room.blendContext || 'focus',
+      hostId: room.users[0]?.id,
+      blend: room.blend || null,
+    });
              
     io.to(roomCode).emit('room-users', room.users);
   });
 
-  socket.on('start-werewolf', ({ roomCode }) => {
+  socket.on('update-room-taste', ({
+    roomCode,
+    userId,
+    playerName,
+    topArtists,
+    topTracks,
+    blendCandidates,
+  }) => {
+    const room = rooms.get(roomCode);
+    const user = room?.users.find((roomUser) => roomUser.id === userId);
+
+    if (!room || !user) {
+      return;
+    }
+
+    user.playerName = playerName || user.playerName;
+    user.topArtists = topArtists || [];
+    user.topTracks = topTracks || [];
+    user.blendCandidates = blendCandidates || [];
+    socket.data.topArtists = user.topArtists;
+    socket.data.topTracks = user.topTracks;
+    socket.data.blendCandidates = user.blendCandidates;
+
+    const readyUsers = room.users.filter(
+      (roomUser) => (roomUser.topTracks || []).length > 0 || (roomUser.blendCandidates || []).length > 0
+    );
+
+    if (readyUsers.length >= 2) {
+      try {
+        room.blend = createContextBlend(readyUsers, room.blendContext || 'focus', { limit: 120 });
+      } catch (error) {
+        room.blend = null;
+        socket.emit('context-blend-error', { error: error.message });
+      }
+    } else {
+      room.blend = null;
+    }
+
+    io.to(roomCode).emit('room-users', room.users);
+    io.to(roomCode).emit('blend-context-state', {
+      context: room.blendContext || 'focus',
+      hostId: room.users[0]?.id,
+      blend: room.blend || null,
+    });
+  });
+
+  socket.on('change-host', ({ roomCode, userId, targetUserId }) => {
     const room = rooms.get(roomCode);
 
-    if (!room || room.users.length < 4) {
+    // Host transfers are a lobby action. During a game, the active game
+    // controls and state remain owned by the current host.
+    if (
+      !room ||
+      room.users[0]?.id !== userId ||
+      games.has(roomCode) ||
+      werewolfGames.has(roomCode) ||
+      userId === targetUserId
+    ) {
       return;
     }
 
-    const game = createWerewolfGame(room);
-    const allTracks = room.users.flatMap(
-      (user) => user.topTracks || []
+    const targetIndex = room.users.findIndex(
+      (user) => user.id === targetUserId
     );
 
-    if (allTracks.length < 2) {
+    if (targetIndex < 1) {
       return;
     }
 
-    const listenerSong =
-      allTracks[Math.floor(Math.random() * allTracks.length)];
+    const [targetUser] = room.users.splice(targetIndex, 1);
+    room.users.unshift(targetUser);
 
-    const differentTracks = allTracks.filter(
-      (track) => track.id !== listenerSong.id
-    );
-
-    const imposterSong =
-      differentTracks[
-        Math.floor(Math.random() * differentTracks.length)
-      ];
-
-    if (!listenerSong || !imposterSong) {
-      return;
-    }
-
-    game.listenerSong = listenerSong;
-    game.imposterSong = imposterSong;
-
-    werewolfGames.set(roomCode, game);
-
-    room.users.forEach((user) => {
-      const targetSocket = [...io.sockets.sockets.values()].find(
-        (socket) => socket.data.userId === user.id
-      );
-
-      if (!targetSocket) {
-        return;
-      }
-
-      const role = game.roles.get(user.id);
-
-      const song =
-        role === 'imposter'
-          ? game.imposterSong
-          : game.listenerSong;
-
-      targetSocket.emit('werewolf-started', {
-        role,
-        song: {
-          name: song.name,
-          artist: song.artists?.[0]?.name || 'Unknown Artist',
-          image: song.album?.images?.[0]?.url || '',
-          spotifyUrl: song.external_urls?.spotify || '',
-        },
-      });
+    io.to(roomCode).emit('room-users', room.users);
+    io.to(roomCode).emit('blend-context-state', {
+      context: room.blendContext || 'focus',
+      hostId: room.users[0]?.id,
+      blend: room.blend || null,
     });
+  });
 
-    console.log(`Werewolf game started in room ${roomCode}`);
+  socket.on('start-werewolf', ({ roomCode, userId }) => {
+    const room = rooms.get(roomCode);
+
+    if (!room || room.users[0]?.id !== userId) {
+      return;
+    }
+
+    startWerewolfGame(roomCode);
+  });
+
+  socket.on('restart-werewolf', ({ roomCode, userId }) => {
+    const room = rooms.get(roomCode);
+
+    if (!room || room.users[0]?.id !== userId) {
+      return;
+    }
+
+    startWerewolfGame(roomCode);
+  });
+
+  socket.on('end-werewolf', ({ roomCode, userId }) => {
+    const room = rooms.get(roomCode);
+
+    if (!room || room.users[0]?.id !== userId) {
+      return;
+    }
+
+    const game = werewolfGames.get(roomCode);
+    if (game?.votingTimer) {
+      clearTimeout(game.votingTimer);
+    }
+    if (game?.imposterGuessTimer) {
+      clearTimeout(game.imposterGuessTimer);
+    }
+    werewolfGames.delete(roomCode);
+    io.to(roomCode).emit('werewolf-ended');
+  });
+
+  socket.on('end-game', ({ roomCode, userId }) => {
+    const room = rooms.get(roomCode);
+
+    if (!room || room.users[0]?.id !== userId) {
+      return;
+    }
+
+    const game = games.get(roomCode);
+    if (game?.roundTimer) {
+      clearTimeout(game.roundTimer);
+    }
+    games.delete(roomCode);
+    io.to(roomCode).emit('game-ended');
   });
 
   socket.on('submit-werewolf-clue', ({ roomCode, userId, clue }) => {
@@ -414,19 +767,7 @@ io.on('connection', (socket) => {
       playerName: player.playerName,
     });
 
-    if (game.clues.size === activePlayers.length) {
-      game.phase = 'voting';
-
-      const clues = activePlayers.map((user) => ({
-        userId: user.id,
-        playerName: user.playerName,
-        clue: game.clues.get(user.id).clue,
-      }));
-
-      io.to(roomCode).emit('werewolf-voting-start', {
-        clues,
-      });
-    }
+    startWerewolfVoting(roomCode);
   });
 
   socket.on('submit-werewolf-vote', ({ roomCode, userId, votedUserId }) => {
@@ -477,105 +818,7 @@ io.on('connection', (socket) => {
     });
 
     if (game.votes.size === activePlayers.length) {
-      const voteCounts = new Map();
-
-      game.votes.forEach((votedUserId) => {
-        const currentVotes =
-          voteCounts.get(votedUserId) || 0;
-
-        voteCounts.set(
-          votedUserId,
-          currentVotes + 1
-        );
-      });
-
-      let eliminatedUserId = null;
-      let highestVotes = 0;
-
-      voteCounts.forEach((count, votedUserId) => {
-        if (count > highestVotes) {
-          highestVotes = count;
-          eliminatedUserId = votedUserId;
-        }
-      });
-
-      const eliminatedPlayer = activePlayers.find(
-        (user) => user.id === eliminatedUserId
-      );
-
-      if (!eliminatedPlayer) {
-        return;
-      }
-
-      const voteResults = activePlayers.map((user) => ({
-        playerName: user.playerName,
-        votedUserId: game.votes.get(user.id),
-      }));
-
-      const isImposter =
-        eliminatedPlayer.id === game.imposterId;
-
-      if (isImposter) {
-        // Stay on the results screen first.
-        game.phase = 'voting-results';
-      } else {
-        // Remember this player as eliminated.
-        game.eliminatedPlayers.push(eliminatedPlayer.id);
-
-        // Stay on the results screen.
-        game.phase = 'voting-results';
-      }
-
-      io.to(roomCode).emit('werewolf-voting-results', {
-        votes: voteResults,
-        eliminatedPlayer: {
-          userId: eliminatedPlayer.id,
-          playerName: eliminatedPlayer.playerName,
-        },
-        isImposter,
-      });
-
-      if (isImposter) {
-        setTimeout(() => {
-          const currentGame = werewolfGames.get(roomCode);
-
-          if (!currentGame) {
-            return;
-          }
-
-          currentGame.phase = 'imposter-guess';
-
-          io.to(roomCode).emit(
-            'werewolf-imposter-guess-start'
-          );
-
-          console.log(
-            `Imposter final guess started in room ${roomCode}`
-          );
-        }, 3000);
-      }
-
-      // If a Listener was eliminated, wait 3 seconds
-      // before automatically starting the next clue round.
-      if (!isImposter) {
-        setTimeout(() => {
-          const currentGame = werewolfGames.get(roomCode);
-
-          if (!currentGame) {
-            return;
-          }
-
-          currentGame.clues = new Map();
-          currentGame.votes = new Map();
-          currentGame.phase = 'clue';
-
-          io.to(roomCode).emit('werewolf-new-clue-round');
-
-          console.log(
-            `Werewolf new clue round started in room ${roomCode}`
-          );
-        }, 3000);
-      }
+      resolveWerewolfVoting(roomCode);
     }
   });
 
@@ -639,6 +882,199 @@ io.on('connection', (socket) => {
     }
   );
 
+  socket.on('leave-werewolf', ({ roomCode, userId }) => {
+    const room = rooms.get(roomCode);
+
+    if (!room) {
+      socket.emit('room-left', { roomCode, userId });
+      return;
+    }
+
+    // The host ends the game for everyone; only non-host players can leave
+    // the room from the active Werewolf screen.
+    if (room.users[0]?.id === userId) {
+      return;
+    }
+
+    const user = room.users.find((roomUser) => roomUser.id === userId);
+
+    if (!user) {
+      socket.emit('room-left', { roomCode, userId });
+      return;
+    }
+
+    const playerName = user.playerName || 'A player';
+    const game = werewolfGames.get(roomCode);
+    const hadWerewolfGame = Boolean(game);
+    const wasImposter = game?.imposterId === userId;
+
+    if (game) {
+      game.roles?.delete(userId);
+      game.clues?.delete(userId);
+      game.votes?.delete(userId);
+      game.eliminatedPlayers = game.eliminatedPlayers.filter(
+        (playerId) => playerId !== userId
+      );
+    }
+
+    room.users = room.users.filter((roomUser) => roomUser.id !== userId);
+
+    socket.to(roomCode).emit('player-left', { userId, playerName });
+    socket.leave(roomCode);
+    socket.data.roomCode = null;
+    socket.data.userId = null;
+    socket.data.topArtists = null;
+    socket.data.topTracks = null;
+    socket.data.blendCandidates = null;
+    socket.emit('room-left', { roomCode, userId });
+
+    if (room.users.length === 0) {
+      if (game?.votingTimer) {
+        clearTimeout(game.votingTimer);
+      }
+      if (game?.imposterGuessTimer) {
+        clearTimeout(game.imposterGuessTimer);
+      }
+      werewolfGames.delete(roomCode);
+      rooms.delete(roomCode);
+      return;
+    }
+
+    io.to(roomCode).emit('room-users', room.users);
+
+    if (hadWerewolfGame && (wasImposter || room.users.length < 2)) {
+      if (game?.votingTimer) {
+        clearTimeout(game.votingTimer);
+      }
+      if (game?.imposterGuessTimer) {
+        clearTimeout(game.imposterGuessTimer);
+      }
+      werewolfGames.delete(roomCode);
+      io.to(roomCode).emit('werewolf-ended');
+    } else if (hadWerewolfGame) {
+      const activePlayers = room.users.filter(
+        (roomUser) => !game.eliminatedPlayers.includes(roomUser.id)
+      );
+
+      if (
+        activePlayers.length <= 2 &&
+        activePlayers.some((roomUser) => roomUser.id === game.imposterId)
+      ) {
+        scheduleWerewolfImposterGuess(roomCode, game);
+      }
+
+      if (game.phase === 'clue') {
+        // A player may have been the last clue submitter. Re-evaluate the
+        // phase after removing them so the remaining room cannot hang.
+        startWerewolfVoting(roomCode);
+      } else if (game.phase === 'voting' && game.votes.size === activePlayers.length) {
+        resolveWerewolfVoting(roomCode);
+      }
+    }
+
+    const readyUsers = room.users.filter(
+      (roomUser) =>
+        (roomUser.topTracks || []).length > 0 ||
+        (roomUser.blendCandidates || []).length > 0
+    );
+    if (readyUsers.length >= 2) {
+      try {
+        room.blend = createContextBlend(
+          readyUsers,
+          room.blendContext || 'focus',
+          { limit: 120 }
+        );
+      } catch (error) {
+        room.blend = null;
+        io.to(roomCode).emit('context-blend-error', { error: error.message });
+      }
+    } else {
+      room.blend = null;
+    }
+
+    io.to(roomCode).emit('blend-context-state', {
+      context: room.blendContext || 'focus',
+      hostId: room.users[0]?.id,
+      blend: room.blend || null,
+    });
+  });
+
+  socket.on('leave-room', ({ roomCode, userId }) => {
+    const room = rooms.get(roomCode);
+
+    if (!room) {
+      socket.emit('room-left', { roomCode, userId });
+      return;
+    }
+
+    const user = room.users.find((roomUser) => roomUser.id === userId);
+
+    if (!user) {
+      socket.emit('room-left', { roomCode, userId });
+      return;
+    }
+
+    const playerName = user.playerName || 'A player';
+    room.users = room.users.filter((roomUser) => roomUser.id !== userId);
+
+    const game = werewolfGames.get(roomCode);
+    const hadWerewolfGame = Boolean(game);
+    const hadGuessGame = games.has(roomCode);
+    if (game?.votingTimer) {
+      clearTimeout(game.votingTimer);
+    }
+    if (game?.imposterGuessTimer) {
+      clearTimeout(game.imposterGuessTimer);
+    }
+    games.delete(roomCode);
+    werewolfGames.delete(roomCode);
+
+    socket.to(roomCode).emit('player-left', { userId, playerName });
+    socket.leave(roomCode);
+    socket.data.roomCode = null;
+    socket.data.userId = null;
+
+    socket.emit('room-left', { roomCode, userId });
+
+    if (room.users.length === 0) {
+      rooms.delete(roomCode);
+      return;
+    }
+
+    io.to(roomCode).emit('room-users', room.users);
+
+    if (hadWerewolfGame) {
+      io.to(roomCode).emit('werewolf-ended');
+    }
+    if (hadGuessGame) {
+      io.to(roomCode).emit('game-ended');
+    }
+
+    const readyUsers = room.users.filter(
+      (roomUser) => (roomUser.topTracks || []).length > 0 || (roomUser.blendCandidates || []).length > 0
+    );
+    if (readyUsers.length >= 2) {
+      try {
+        room.blend = createContextBlend(readyUsers, room.blendContext || 'focus', { limit: 120 });
+      } catch (error) {
+        room.blend = null;
+        io.to(roomCode).emit('context-blend-error', { error: error.message });
+      }
+    } else {
+      room.blend = null;
+    }
+
+    io.to(roomCode).emit('blend-context-state', {
+      context: room.blendContext || 'focus',
+      hostId: room.users[0]?.id,
+      blend: room.blend || null,
+    });
+
+    if (room.users.length < 2 && !hadGuessGame) {
+      io.to(roomCode).emit('game-ended');
+    }
+  });
+
   socket.on('disconnect', () => {
     const { roomCode, userId } = socket.data;
 
@@ -663,6 +1099,9 @@ io.on('connection', (socket) => {
     }
 
     const playerName = user.playerName;
+    const game = werewolfGames.get(roomCode);
+    const hadWerewolfGame = Boolean(game);
+    const hadGuessGame = games.has(roomCode);
 
     room.users = room.users.filter(
       (user) => user.id !== userId
@@ -677,11 +1116,60 @@ io.on('connection', (socket) => {
     // Update the room's player list
     io.to(roomCode).emit('room-users', room.users);
 
-    // If only one player remains, stop the game
+    // If only one player remains, stop any active game and promote the next
+    // room member to host for future lobby actions.
     if (room.users.length < 2) {
       games.delete(roomCode);
-
+      if (game?.votingTimer) {
+        clearTimeout(game.votingTimer);
+      }
+      if (game?.imposterGuessTimer) {
+        clearTimeout(game.imposterGuessTimer);
+      }
+      werewolfGames.delete(roomCode);
       io.to(roomCode).emit('game-ended');
+    }
+
+    if (hadWerewolfGame) {
+      if (game?.votingTimer) {
+        clearTimeout(game.votingTimer);
+      }
+      if (game?.imposterGuessTimer) {
+        clearTimeout(game.imposterGuessTimer);
+      }
+      werewolfGames.delete(roomCode);
+      io.to(roomCode).emit('werewolf-ended');
+    }
+    if (hadGuessGame) {
+      const guessGame = games.get(roomCode);
+      if (guessGame?.roundTimer) {
+        clearTimeout(guessGame.roundTimer);
+      }
+      games.delete(roomCode);
+      io.to(roomCode).emit('game-ended');
+    }
+
+    if (room.users.length === 0) {
+      rooms.delete(roomCode);
+    } else {
+      const readyUsers = room.users.filter(
+        (roomUser) => (roomUser.topTracks || []).length > 0 || (roomUser.blendCandidates || []).length > 0
+      );
+      if (readyUsers.length >= 2) {
+        try {
+          room.blend = createContextBlend(readyUsers, room.blendContext || 'focus', { limit: 120 });
+        } catch (error) {
+          room.blend = null;
+          io.to(roomCode).emit('context-blend-error', { error: error.message });
+        }
+      } else {
+        room.blend = null;
+      }
+      io.to(roomCode).emit('blend-context-state', {
+        context: room.blendContext || 'focus',
+        hostId: room.users[0]?.id,
+        blend: room.blend,
+      });
     }
   });
 
@@ -932,6 +1420,80 @@ io.on('connection', (socket) => {
     socket.leave(roomCode);
 
     console.log(`${playerName} left game ${roomCode}`);
+  });
+
+  socket.on('set-blend-context', ({ roomCode, userId, context }) => {
+    const room = rooms.get(roomCode);
+    if (!room) return socket.emit('context-blend-error', { error: 'Room not found' });
+    if (room.users[0]?.id !== userId) return socket.emit('context-blend-error', { error: 'Only the host can change the Blend context' });
+    if (!CONTEXTS[context]) return socket.emit('context-blend-error', { error: 'Unknown Blend context' });
+    room.blendContext = context;
+    const readyUsers = room.users.filter(
+      (user) => (user.topTracks || []).length > 0 || (user.blendCandidates || []).length > 0
+    );
+
+    if (readyUsers.length >= 2) {
+      try {
+        room.blend = createContextBlend(readyUsers, context, { limit: 120 });
+      } catch (error) {
+        room.blend = null;
+        socket.emit('context-blend-error', { error: error.message });
+      }
+    } else {
+      room.blend = null;
+    }
+
+    io.to(roomCode).emit('blend-context-state', {
+      context,
+      hostId: room.users[0]?.id,
+      blend: room.blend,
+    });
+  });
+
+  socket.on('create-context-blend', ({ roomCode, userId, context }) => {
+    const room = rooms.get(roomCode);
+
+    if (!room) {
+      socket.emit('context-blend-error', {
+        error: 'Room not found',
+      });
+      return;
+    }
+
+    if (room.users[0]?.id !== userId) {
+      socket.emit('context-blend-error', {
+        error: 'Only the host can create a blend',
+      });
+      return;
+    }
+
+    const readyUsers = room.users.filter(
+      (user) => (user.topTracks || []).length > 0 || (user.blendCandidates || []).length > 0
+    );
+
+    if (readyUsers.length < 2) {
+      socket.emit('context-blend-error', {
+        error: 'Need at least two players with Spotify top tracks',
+      });
+      return;
+    }
+
+    try {
+      const selectedContext = CONTEXTS[room.blendContext]
+        ? room.blendContext
+        : (CONTEXTS[context] ? context : 'focus');
+      room.blendContext = selectedContext;
+      const blend = createContextBlend(readyUsers, selectedContext, {
+        limit: 120,
+      });
+
+      room.blend = blend;
+      io.to(roomCode).emit('context-blend-ready', blend);
+    } catch (error) {
+      socket.emit('context-blend-error', {
+        error: error.message,
+      });
+    }
   });
 });
 
