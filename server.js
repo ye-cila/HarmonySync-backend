@@ -6,6 +6,13 @@ const axios = require('axios');
 const querystring = require('querystring');
 require('dotenv').config();
 const crypto = require('crypto');
+const {
+  DatabaseError,
+  getLeaderboard,
+  isUuid,
+  saveGameScores,
+  upsertUser,
+} = require('./services/supabase');
 
 const rooms = new Map();
 const games = new Map();
@@ -25,6 +32,52 @@ const io = new Server(server, {
 });
 const PORT = process.env.PORT || 8888;
 const WEREWOLF_VOTING_SECONDS = 30;
+const GAME_TYPES = new Set(['werewolf', 'spotify_guess']);
+
+const normalizeGameType = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+
+  if (normalized === 'spotify-taste' || normalized === 'spotify_taste' || normalized === 'spotify-guess') {
+    return 'spotify_guess';
+  }
+
+  return normalized;
+};
+
+const logDatabaseFailure = (operation, error) => {
+  console.error(`[Database] ${operation} failed`, error?.message || error);
+};
+
+const persistSpotifyGameScores = (room, game) => {
+  if (!room || !game?.scores) {
+    return;
+  }
+
+  const scores = room.users
+    .filter((user) => isUuid(user.databaseUserId))
+    .map((user) => ({
+      userId: user.databaseUserId,
+      gameType: 'spotify_guess',
+      score: game.scores.get(user.id) || 0,
+    }));
+
+  if (scores.length === 0) {
+    return;
+  }
+
+  void saveGameScores(scores).catch((error) => {
+    logDatabaseFailure('persist Spotify Guess scores', error);
+  });
+};
+
+const respondWithDatabaseError = (res, error, fallbackMessage) => {
+  if (error instanceof DatabaseError) {
+    return res.status(error.statusCode || 502).json({ error: fallbackMessage });
+  }
+
+  logDatabaseFailure(fallbackMessage, error);
+  return res.status(502).json({ error: fallbackMessage });
+};
 
 const generateRoomCode = () => {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -393,8 +446,31 @@ app.get('/callback', async (req,res) => {
 
     const { access_token, refresh_token, expires_in } = response.data;
 
+    // The Spotify token stays in the existing frontend flow. Only the
+    // non-sensitive Spotify profile fields are persisted in Supabase.
+    try {
+      const profileResponse = await axios.get('https://api.spotify.com/v1/me', {
+        headers: {
+          Authorization: `Bearer ${access_token}`,
+        },
+      });
+
+      await upsertUser({
+        spotifyId: profileResponse.data.id,
+        displayName: profileResponse.data.display_name,
+        avatarUrl: profileResponse.data.images?.[0]?.url || null,
+      });
+    } catch (error) {
+      // A database outage must not prevent Spotify authentication from
+      // completing. The frontend retries persistence after loading /me.
+      logDatabaseFailure('persist authenticated Spotify user', error);
+    }
+
     // Redirect user back to frontend
-    res.redirect(`${CLIENT_URL}/?access_token=${access_token}&refresh_token=${refresh_token}`);
+    const redirectUrl = new URL(CLIENT_URL);
+    redirectUrl.searchParams.set('access_token', access_token);
+    redirectUrl.searchParams.set('refresh_token', refresh_token);
+    res.redirect(redirectUrl.toString());
 
   } catch (error) {
     console.error('Error fetching token:', error.response?.data || error.message);
@@ -402,6 +478,44 @@ app.get('/callback', async (req,res) => {
   }
 
 })
+
+app.post('/users/sync', async (req, res) => {
+  const { spotifyId, displayName, avatarUrl } = req.body || {};
+
+  if (!spotifyId || typeof spotifyId !== 'string') {
+    return res.status(400).json({ error: 'Spotify user id is required' });
+  }
+
+  try {
+    const user = await upsertUser({ spotifyId, displayName, avatarUrl });
+    return res.json({
+      userId: user.id,
+      spotifyId: user.spotify_id,
+      displayName: user.display_name,
+      avatarUrl: user.avatar_url,
+    });
+  } catch (error) {
+    return respondWithDatabaseError(res, error, 'Could not sync Spotify user');
+  }
+});
+
+app.get('/leaderboard', async (req, res) => {
+  const gameType = normalizeGameType(req.query.gameType);
+
+  if (!GAME_TYPES.has(gameType)) {
+    return res.status(400).json({
+      error: 'Invalid game type',
+      allowedGameTypes: [...GAME_TYPES],
+    });
+  }
+
+  try {
+    const leaderboard = await getLeaderboard(gameType);
+    return res.json(leaderboard);
+  } catch (error) {
+    return respondWithDatabaseError(res, error, 'Could not load leaderboard');
+  }
+});
 
 // Refresh Spotify access token
 app.post('/refresh', async (req, res) => {
@@ -471,6 +585,8 @@ app.post('/rooms', (req, res) => {
     blendContext: 'focus',
     users: [{
       id: userId,
+      databaseUserId: null,
+      timeRange: 'medium_term',
     }],
   });
 
@@ -504,6 +620,8 @@ app.post('/rooms/:roomCode/join', (req, res) => {
 
   room.users.push({
     id: userId,
+    databaseUserId: null,
+    timeRange: 'medium_term',
   });
 
   res.json({
@@ -524,6 +642,8 @@ io.on('connection', (socket) => {
     topArtists,
     topTracks,
     blendCandidates,
+    databaseUserId,
+    timeRange,
   }) => {
     socket.join(roomCode);
 
@@ -532,6 +652,8 @@ io.on('connection', (socket) => {
     socket.data.topArtists = topArtists;
     socket.data.topTracks = topTracks;
     socket.data.blendCandidates = blendCandidates;
+    socket.data.databaseUserId = databaseUserId;
+    socket.data.timeRange = timeRange;
 
     console.log(`${socket.id} joined room ${roomCode}`);
 
@@ -559,6 +681,8 @@ io.on('connection', (socket) => {
       user.topArtists = topArtists;
       user.topTracks = topTracks;
       user.blendCandidates = blendCandidates || [];
+      user.databaseUserId = isUuid(databaseUserId) ? databaseUserId : null;
+      user.timeRange = timeRange || 'medium_term';
     }
 
     const readyUsers = room.users.filter(
@@ -591,6 +715,8 @@ io.on('connection', (socket) => {
     topArtists,
     topTracks,
     blendCandidates,
+    databaseUserId,
+    timeRange,
   }) => {
     const room = rooms.get(roomCode);
     const user = room?.users.find((roomUser) => roomUser.id === userId);
@@ -603,9 +729,13 @@ io.on('connection', (socket) => {
     user.topArtists = topArtists || [];
     user.topTracks = topTracks || [];
     user.blendCandidates = blendCandidates || [];
+    user.databaseUserId = isUuid(databaseUserId) ? databaseUserId : user.databaseUserId || null;
+    user.timeRange = timeRange || user.timeRange || 'medium_term';
     socket.data.topArtists = user.topArtists;
     socket.data.topTracks = user.topTracks;
     socket.data.blendCandidates = user.blendCandidates;
+    socket.data.databaseUserId = user.databaseUserId;
+    socket.data.timeRange = user.timeRange;
 
     const readyUsers = room.users.filter(
       (roomUser) => (roomUser.topTracks || []).length > 0 || (roomUser.blendCandidates || []).length > 0
@@ -713,6 +843,7 @@ io.on('connection', (socket) => {
     if (game?.roundTimer) {
       clearTimeout(game.roundTimer);
     }
+    persistSpotifyGameScores(room, game);
     games.delete(roomCode);
     io.to(roomCode).emit('game-ended');
   });
